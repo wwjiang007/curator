@@ -36,6 +36,7 @@ import org.apache.curator.framework.imps.GzipCompressionProvider;
 import org.apache.curator.framework.schema.SchemaSet;
 import org.apache.curator.framework.state.ConnectionState;
 import org.apache.curator.framework.state.ConnectionStateErrorPolicy;
+import org.apache.curator.framework.state.ConnectionStateListenerDecorator;
 import org.apache.curator.framework.state.StandardConnectionStateErrorPolicy;
 import org.apache.curator.utils.DefaultZookeeperFactory;
 import org.apache.curator.utils.ZookeeperFactory;
@@ -47,6 +48,8 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import org.apache.curator.CuratorZookeeperClient;
@@ -149,6 +152,9 @@ public class CuratorFrameworkFactory
         private SchemaSet schemaSet = SchemaSet.getDefaultSchemaSet();
         private boolean zk34CompatibilityMode = isZK34();
         private int waitForShutdownTimeoutMs = 0;
+        private Executor runSafeService = null;
+        private ConnectionStateListenerDecorator connectionStateListenerDecorator = ConnectionStateListenerDecorator.standard;
+
         /**
          * Apply the current values and build a new CuratorFramework
          *
@@ -189,7 +195,7 @@ public class CuratorFrameworkFactory
 
         /**
          * Add connection authorization
-         * 
+         *
          * Subsequent calls to this method overwrite the prior calls.
          *
          * @param scheme the scheme
@@ -474,6 +480,44 @@ public class CuratorFrameworkFactory
             return this;
         }
 
+        /**
+         * Curator (and user) recipes will use this executor to call notifyAll
+         * and other blocking calls that might normally block ZooKeeper's event thread.
+         * By default, an executor is allocated internally using the provided (or default)
+         * {@link #threadFactory(java.util.concurrent.ThreadFactory)}. Use this method
+         * to set a custom executor.
+         *
+         * @param runSafeService executor to use for calls to notifyAll from Watcher callbacks etc
+         * @return this
+         * @since 4.1.0
+         */
+        public Builder runSafeService(Executor runSafeService)
+        {
+            this.runSafeService = runSafeService;
+            return this;
+        }
+
+        /**
+         * Sets the connection state listener decorator. For example,
+         * you can set {@link org.apache.curator.framework.state.CircuitBreakingConnectionStateListener}s
+         * via this mechanism by using {@link org.apache.curator.framework.state.ConnectionStateListenerDecorator#circuitBreaking(org.apache.curator.RetryPolicy)}
+         * or {@link org.apache.curator.framework.state.ConnectionStateListenerDecorator#circuitBreaking(org.apache.curator.RetryPolicy, java.util.concurrent.ScheduledExecutorService)}
+         *
+         * @param connectionStateListenerDecorator decorator to use
+         * @return this
+         * @since 4.2.0
+         */
+        public Builder connectionStateListenerDecorator(ConnectionStateListenerDecorator connectionStateListenerDecorator)
+        {
+            this.connectionStateListenerDecorator = Objects.requireNonNull(connectionStateListenerDecorator, "connectionStateListenerFactory cannot be null");
+            return this;
+        }
+
+        public Executor getRunSafeService()
+        {
+            return runSafeService;
+        }
+
         public ACLProvider getAclProvider()
         {
             return aclProvider;
@@ -614,6 +658,11 @@ public class CuratorFrameworkFactory
         public boolean canBeReadOnly()
         {
             return canBeReadOnly;
+        }
+
+        public ConnectionStateListenerDecorator getConnectionStateListenerDecorator()
+        {
+            return connectionStateListenerDecorator;
         }
 
         private Builder()

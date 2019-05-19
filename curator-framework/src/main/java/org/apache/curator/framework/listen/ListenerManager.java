@@ -16,25 +16,29 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.curator.test.compatibility;
+package org.apache.curator.framework.listen;
 
-import org.apache.curator.test.Compatibility;
-import org.apache.zookeeper.ZooKeeper;
+import java.util.function.Consumer;
 
-/**
- * <p>
- *     Utility to simulate a ZK session dying.
- * </p>
- */
-public class KillSession2
+public interface ListenerManager<K, V> extends Listenable<K>
 {
     /**
-     * Kill the given ZK session
-     *
-     * @param client the client to kill
+     * Remove all listeners
      */
-    public static void     kill(ZooKeeper client)
-    {
-        Compatibility.injectSessionExpiration(client);
-    }
+    void clear();
+
+    /**
+     * Return the number of listeners
+     *
+     * @return number
+     */
+    int size();
+
+    /**
+     * Utility - apply the given function to each listener. The function receives
+     * the listener as an argument.
+     *
+     * @param function function to call for each listener
+     */
+    void forEach(Consumer<V> function);
 }

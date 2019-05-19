@@ -98,6 +98,11 @@ public class BaseClassForTests
         System.setProperty(INTERNAL_PROPERTY_REMOVE_WATCHERS_IN_FOREGROUND, "true");
         System.setProperty(INTERNAL_PROPERTY_VALIDATE_NAMESPACE_WATCHER_MAP_EMPTY, "true");
 
+        createServer();
+    }
+
+    protected void createServer() throws Exception
+    {
         while ( server == null )
         {
             try
@@ -160,6 +165,7 @@ public class BaseClassForTests
                 return false;
             }
 
+            result.setStatus(ITestResult.SKIP);
             if ( result.getThrowable() != null )
             {
                 log.error("Retrying 1 time", result.getThrowable());

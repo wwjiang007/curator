@@ -28,8 +28,10 @@ import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.imps.TestCleanState;
 import org.apache.curator.framework.state.ConnectionState;
 import org.apache.curator.framework.state.ConnectionStateListener;
+import org.apache.curator.framework.state.ConnectionStateListenerDecorator;
 import org.apache.curator.framework.state.SessionConnectionStateErrorPolicy;
 import org.apache.curator.framework.state.StandardConnectionStateErrorPolicy;
+import org.apache.curator.retry.RetryForever;
 import org.apache.curator.retry.RetryNTimes;
 import org.apache.curator.retry.RetryOneTime;
 import org.apache.curator.test.BaseClassForTests;
@@ -59,6 +61,46 @@ public class TestLeaderLatch extends BaseClassForTests
     private static final int MAX_LOOPS = 5;
 
     @Test
+    public void testWithCircuitBreaker() throws Exception
+    {
+        Timing2 timing = new Timing2();
+        ConnectionStateListenerDecorator decorator = ConnectionStateListenerDecorator.circuitBreaking(new RetryForever(timing.multiple(2).milliseconds()));
+        try ( CuratorFramework client = CuratorFrameworkFactory.builder()
+            .connectString(server.getConnectString())
+            .retryPolicy(new RetryOneTime(1))
+            .connectionStateListenerDecorator(decorator)
+            .connectionTimeoutMs(timing.connection())
+            .sessionTimeoutMs(timing.session())
+            .build() )
+        {
+            client.start();
+            AtomicInteger resetCount = new AtomicInteger(0);
+            try ( LeaderLatch latch = new LeaderLatch(client, "/foo/bar")
+            {
+                @Override
+                void reset() throws Exception
+                {
+                    resetCount.incrementAndGet();
+                    super.reset();
+                }
+            } )
+            {
+                latch.start();
+                Assert.assertTrue(latch.await(timing.forWaiting().milliseconds(), TimeUnit.MILLISECONDS));
+
+                for ( int i = 0; i < 5; ++i )
+                {
+                    server.stop();
+                    server.restart();
+                    timing.sleepABit();
+                }
+                Assert.assertTrue(latch.await(timing.forWaiting().milliseconds(), TimeUnit.MILLISECONDS));
+                Assert.assertEquals(resetCount.get(), 2);
+            }
+        }
+    }
+
+    @Test
     public void testUncreatedPathGetLeader() throws Exception
     {
         try ( CuratorFramework client = CuratorFrameworkFactory.newClient(server.getConnectString(), new RetryOneTime(1)) )
@@ -66,6 +108,42 @@ public class TestLeaderLatch extends BaseClassForTests
             client.start();
             LeaderLatch latch = new LeaderLatch(client, "/foo/bar");
             latch.getLeader();  // CURATOR-436 - was throwing NoNodeException
+        }
+    }
+
+    @Test
+    public void testWatchedNodeDeletedOnReconnect() throws Exception
+    {
+        final String latchPath = "/foo/bar";
+        Timing2 timing = new Timing2();
+        try ( CuratorFramework client = CuratorFrameworkFactory.newClient(server.getConnectString(), timing.session(), timing.connection(), new RetryOneTime(1)) )
+        {
+            client.start();
+            LeaderLatch latch1 = new LeaderLatch(client, latchPath, "1");
+            try ( LeaderLatch latch2 = new LeaderLatch(client, latchPath, "2") )
+            {
+                latch1.start();
+                latch1.await();
+
+                latch2.start(); // will get a watcher on latch1's node
+                timing.sleepABit();
+
+                latch2.debugCheckLeaderShipLatch = new CountDownLatch(1);
+                latch1.close();   // simulate the leader's path getting deleted
+                latch1 = null;
+                timing.sleepABit(); // after this, latch2 should be blocked just before getting the path in checkLeadership()
+
+                latch2.reset(); // force the internal "ourPath" to get reset
+                latch2.debugCheckLeaderShipLatch.countDown();   // allow checkLeadership() to continue
+
+                Assert.assertTrue(latch2.await(timing.forSessionSleep().forWaiting().milliseconds(), TimeUnit.MILLISECONDS));
+                timing.sleepABit();
+                Assert.assertEquals(client.getChildren().forPath(latchPath).size(), 1);
+            }
+            finally
+            {
+                CloseableUtils.closeQuietly(latch1);
+            }
         }
     }
 

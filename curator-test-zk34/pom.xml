@@ -3,7 +3,7 @@
     <parent>
         <artifactId>apache-curator</artifactId>
         <groupId>org.apache.curator</groupId>
-        <version>4.0.2-SNAPSHOT</version>
+        <version>4.2.1-SNAPSHOT</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
 
@@ -168,6 +168,7 @@
                         <dependency>org.apache.curator:curator-framework</dependency>
                         <dependency>org.apache.curator:curator-recipes</dependency>
                     </dependenciesToScan>
+                    <excludedGroups>zk35</excludedGroups>
                 </configuration>
             </plugin>
 
