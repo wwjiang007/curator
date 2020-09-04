@@ -28,7 +28,7 @@ import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.imps.TestCleanState;
 import org.apache.curator.framework.state.ConnectionState;
 import org.apache.curator.framework.state.ConnectionStateListener;
-import org.apache.curator.framework.state.ConnectionStateListenerDecorator;
+import org.apache.curator.framework.state.ConnectionStateListenerManagerFactory;
 import org.apache.curator.framework.state.SessionConnectionStateErrorPolicy;
 import org.apache.curator.framework.state.StandardConnectionStateErrorPolicy;
 import org.apache.curator.retry.RetryForever;
@@ -37,12 +37,14 @@ import org.apache.curator.retry.RetryOneTime;
 import org.apache.curator.test.BaseClassForTests;
 import org.apache.curator.test.TestingServer;
 import org.apache.curator.test.Timing;
+import org.apache.curator.test.compatibility.CuratorTestBase;
 import org.apache.curator.test.compatibility.Timing2;
 import org.apache.curator.utils.CloseableUtils;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
@@ -50,53 +52,115 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
+@Test(groups = CuratorTestBase.zk35TestCompatibilityGroup)
 public class TestLeaderLatch extends BaseClassForTests
 {
     private static final String PATH_NAME = "/one/two/me";
     private static final int MAX_LOOPS = 5;
 
+    private static class Holder
+    {
+        final BlockingQueue<ConnectionState> stateChanges = new LinkedBlockingQueue<>();
+        final CountDownLatch isLockedLatch = new CountDownLatch(1);
+        volatile LeaderLatch latch;
+    }
+
     @Test
     public void testWithCircuitBreaker() throws Exception
     {
+        final int threadQty = 5;
+
+        ExecutorService executorService = Executors.newFixedThreadPool(threadQty);
+        List<Holder> holders = Collections.emptyList();
         Timing2 timing = new Timing2();
-        ConnectionStateListenerDecorator decorator = ConnectionStateListenerDecorator.circuitBreaking(new RetryForever(timing.multiple(2).milliseconds()));
-        try ( CuratorFramework client = CuratorFrameworkFactory.builder()
+        ConnectionStateListenerManagerFactory managerFactory = ConnectionStateListenerManagerFactory.circuitBreaking(new RetryForever(timing.multiple(2).milliseconds()));
+        CuratorFramework client = CuratorFrameworkFactory.builder()
             .connectString(server.getConnectString())
             .retryPolicy(new RetryOneTime(1))
-            .connectionStateListenerDecorator(decorator)
+            .connectionStateListenerManagerFactory(managerFactory)
             .connectionTimeoutMs(timing.connection())
             .sessionTimeoutMs(timing.session())
-            .build() )
-        {
+            .build();
+        try {
             client.start();
-            AtomicInteger resetCount = new AtomicInteger(0);
-            try ( LeaderLatch latch = new LeaderLatch(client, "/foo/bar")
+            client.create().forPath("/hey");
+
+            Semaphore lostSemaphore = new Semaphore(0);
+            ConnectionStateListener unProxiedListener = new ConnectionStateListener()
             {
                 @Override
-                void reset() throws Exception
+                public void stateChanged(CuratorFramework client, ConnectionState newState)
                 {
-                    resetCount.incrementAndGet();
-                    super.reset();
+                    if ( newState == ConnectionState.LOST )
+                    {
+                        lostSemaphore.release();
+                    }
                 }
-            } )
-            {
-                latch.start();
-                Assert.assertTrue(latch.await(timing.forWaiting().milliseconds(), TimeUnit.MILLISECONDS));
 
-                for ( int i = 0; i < 5; ++i )
+                @Override
+                public boolean doNotProxy()
                 {
-                    server.stop();
-                    server.restart();
-                    timing.sleepABit();
+                    return true;
                 }
-                Assert.assertTrue(latch.await(timing.forWaiting().milliseconds(), TimeUnit.MILLISECONDS));
-                Assert.assertEquals(resetCount.get(), 2);
+            };
+            client.getConnectionStateListenable().addListener(unProxiedListener);
+
+            holders = IntStream.range(0, threadQty)
+                .mapToObj(index -> {
+                    Holder holder = new Holder();
+                    holder.latch = new LeaderLatch(client, "/foo/bar/" + index)
+                    {
+                        @Override
+                        protected void handleStateChange(ConnectionState newState)
+                        {
+                            holder.stateChanges.offer(newState);
+                            super.handleStateChange(newState);
+                        }
+                    };
+                    return holder;
+                })
+                .collect(Collectors.toList());
+
+            holders.forEach(holder -> {
+                executorService.submit(() -> {
+                    holder.latch.start();
+                    Assert.assertTrue(holder.latch.await(timing.forWaiting().milliseconds(), TimeUnit.MILLISECONDS));
+                    holder.isLockedLatch.countDown();
+                    return null;
+                });
+                timing.awaitLatch(holder.isLockedLatch);
+            });
+
+            for ( int i = 0; i < 4; ++i )   // note: 4 is just a random number of loops to simulate disconnections
+            {
+                server.stop();
+                Assert.assertTrue(timing.acquireSemaphore(lostSemaphore));
+                server.restart();
+                timing.sleepABit();
             }
+
+            for ( Holder holder : holders )
+            {
+                Assert.assertTrue(holder.latch.await(timing.forWaiting().milliseconds(), TimeUnit.MILLISECONDS));
+                Assert.assertEquals(timing.takeFromQueue(holder.stateChanges), ConnectionState.SUSPENDED);
+                Assert.assertEquals(timing.takeFromQueue(holder.stateChanges), ConnectionState.LOST);
+                Assert.assertEquals(timing.takeFromQueue(holder.stateChanges), ConnectionState.RECONNECTED);
+            }
+        }
+        finally
+        {
+            holders.forEach(holder -> CloseableUtils.closeQuietly(holder.latch));
+            CloseableUtils.closeQuietly(client);
+            executorService.shutdownNow();
         }
     }
 
@@ -123,7 +187,7 @@ public class TestLeaderLatch extends BaseClassForTests
             try ( LeaderLatch latch2 = new LeaderLatch(client, latchPath, "2") )
             {
                 latch1.start();
-                latch1.await();
+                Assert.assertTrue(latch1.await(timing.milliseconds(), TimeUnit.MILLISECONDS));
 
                 latch2.start(); // will get a watcher on latch1's node
                 timing.sleepABit();
